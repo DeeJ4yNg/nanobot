@@ -78,6 +78,27 @@ class ToolsConfig(BaseModel):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
 
 
+class MemoryRetrievalConfig(BaseModel):
+    """Hybrid memory retrieval configuration."""
+    enabled: bool = True
+    top_k: int = 6
+    min_score: float = 0.25
+    bm25_weight: float = 0.5
+    semantic_weight: float = 0.5
+    chunk_size: int = 800
+    chunk_overlap: int = 120
+    max_chunks: int = 2000
+    lsh_planes: int = 12
+    lsh_seed: int = 42
+    embedding_enabled: bool = True
+    embedding_model: str = "text-embedding-3-small"
+    embedding_api_key: str | None = None
+    embedding_api_base: str | None = None
+    summary_enabled: bool = True
+    summary_model: str | None = None
+    summary_max_tokens: int = 600
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -85,6 +106,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory: MemoryRetrievalConfig = Field(default_factory=MemoryRetrievalConfig)
     
     @property
     def workspace_path(self) -> Path:

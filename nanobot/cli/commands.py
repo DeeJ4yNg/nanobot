@@ -202,7 +202,10 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        brave_api_key=config.tools.web.search.api_key or None
+        brave_api_key=config.tools.web.search.api_key or None,
+        memory_config=config.memory,
+        memory_api_key=config.memory.embedding_api_key or config.get_api_key(),
+        memory_api_base=config.memory.embedding_api_base or config.get_api_base(),
     )
     
     # Create cron service
@@ -309,13 +312,16 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        brave_api_key=config.tools.web.search.api_key or None
+        brave_api_key=config.tools.web.search.api_key or None,
+        memory_config=config.memory,
+        memory_api_key=config.memory.embedding_api_key or config.get_api_key(),
+        memory_api_base=config.memory.embedding_api_base or config.get_api_base(),
     )
     
     if message:
         # Single message mode
         async def run_once():
-            response = await agent_loop.process_direct(message, session_id)
+            response = await agent_loop.process_direct(message, session_id, eager_memory=True)
             console.print(f"\n{__logo__} {response}")
         
         asyncio.run(run_once())

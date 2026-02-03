@@ -24,12 +24,19 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        memory_context: str | None = None,
+        include_full_memory: bool = False,
+    ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
+            memory_context: Optional retrieved memory context to inject.
+            include_full_memory: Whether to include full memory context.
         
         Returns:
             Complete system prompt.
@@ -45,9 +52,12 @@ class ContextBuilder:
             parts.append(bootstrap)
         
         # Memory context
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if memory_context:
+            parts.append(f"# Memory\n\n{memory_context}")
+        elif include_full_memory:
+            memory = self.memory.get_memory_context()
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
         
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
@@ -118,6 +128,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         current_message: str,
         skill_names: list[str] | None = None,
         media: list[str] | None = None,
+        memory_context: str | None = None,
+        include_full_memory: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -134,7 +146,11 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(
+            skill_names=skill_names,
+            memory_context=memory_context,
+            include_full_memory=include_full_memory,
+        )
         messages.append({"role": "system", "content": system_prompt})
 
         # History

@@ -11,6 +11,8 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.memory import MemoryRetriever
+from nanobot.config.schema import MemoryRetrievalConfig
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -40,7 +42,10 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 20,
-        brave_api_key: str | None = None
+        brave_api_key: str | None = None,
+        memory_config: MemoryRetrievalConfig | None = None,
+        memory_api_key: str | None = None,
+        memory_api_base: str | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -48,6 +53,7 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.brave_api_key = brave_api_key
+        self.memory_config = memory_config
         
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
@@ -58,6 +64,16 @@ class AgentLoop:
             bus=bus,
             model=self.model,
             brave_api_key=brave_api_key,
+        )
+        self.memory_retriever = (
+            MemoryRetriever(
+                workspace=workspace,
+                config=memory_config,
+                api_key=memory_api_key,
+                api_base=memory_api_base,
+            )
+            if memory_config
+            else None
         )
         
         self._running = False
@@ -85,6 +101,10 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+        
+        if self.memory_retriever and self.memory_retriever.enabled:
+            from nanobot.agent.tools.memory import MemoryRecallTool
+            self.tools.register(MemoryRecallTool(self.memory_retriever))
     
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -237,6 +257,13 @@ class AgentLoop:
         # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
+        channel, chat_id = session_key.split(":", 1) if ":" in session_key else ("cli", "direct")
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(channel, chat_id)
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(channel, chat_id)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -307,23 +334,116 @@ class AgentLoop:
             content=final_content
         )
     
-    async def process_direct(self, content: str, session_key: str = "cli:direct") -> str:
+    async def process_direct(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        eager_memory: bool = False,
+    ) -> str:
         """
         Process a message directly (for CLI usage).
         
         Args:
             content: The message content.
             session_key: Session identifier.
+            eager_memory: Whether to retrieve memory before the LLM call.
         
         Returns:
             The agent's response.
         """
-        msg = InboundMessage(
-            channel="cli",
-            sender_id="user",
-            chat_id="direct",
-            content=content
-        )
+        session = self.sessions.get_or_create(session_key)
+        memory_context = None
+        retrieved = []
+        if eager_memory and self.memory_retriever and self.memory_retriever.enabled:
+            memory_context, retrieved = await self.memory_retriever.retrieve_context(content)
         
-        response = await self._process_message(msg)
-        return response.content if response else ""
+        messages = self.context.build_messages(
+            history=session.get_history(),
+            current_message=content,
+            memory_context=memory_context,
+        )
+        response = await self._run_messages(messages)
+        session.add_message("user", content)
+        session.add_message("assistant", response)
+        self.sessions.save(session)
+        
+        if eager_memory and self.memory_retriever and self.memory_retriever.should_summarize(retrieved):
+            summary = await self._summarize_memory(content, response)
+            if summary:
+                self.memory_retriever.append_summary(summary)
+        
+        return response
+
+    async def _run_messages(self, messages: list[dict[str, Any]]) -> str:
+        iteration = 0
+        final_content = None
+        while iteration < self.max_iterations:
+            iteration += 1
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model
+            )
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts
+                )
+                for tool_call in response.tool_calls:
+                    args_str = json.dumps(tool_call.arguments)
+                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result
+                    )
+            else:
+                final_content = response.content
+                break
+        if final_content is None:
+            return "I've completed processing but have no response to give."
+        return final_content
+    
+    async def _summarize_memory(self, user_text: str, assistant_text: str) -> str | None:
+        if not self.memory_config or not self.memory_config.summary_enabled:
+            return None
+        summary_model = self.memory_config.summary_model or self.model
+        prompt = (
+            "You are a memory summarizer. Create a concise memory entry in markdown. "
+            "Include only durable facts, decisions, and preferences. "
+            "If nothing should be stored, respond with NO_MEMORY.\n\n"
+            "Format:\n"
+            "## Memory Entry (YYYY-MM-DD)\n"
+            "- Summary: ...\n"
+            "- Key Facts:\n"
+            "  - ...\n"
+            "- Decisions:\n"
+            "  - ...\n"
+            "- Tags: ...\n"
+        )
+        response = await self.provider.chat(
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": f"User:\n{user_text}\n\nAssistant:\n{assistant_text}",
+                },
+            ],
+            tools=None,
+            model=summary_model,
+            max_tokens=self.memory_config.summary_max_tokens,
+            temperature=0.2,
+        )
+        content = (response.content or "").strip()
+        if not content or content.upper().startswith("NO_MEMORY"):
+            return None
+        return content
